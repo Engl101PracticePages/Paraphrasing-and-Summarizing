@@ -1,0 +1,946 @@
+import React, { useMemo, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Progress } from "@/components/ui/progress";
+import { Badge } from "@/components/ui/badge";
+import { Separator } from "@/components/ui/separator";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Switch } from "@/components/ui/switch";
+import { Label } from "@/components/ui/label";
+import { AlertTriangle, CheckCircle2, Copy, RefreshCcw, Timer } from "lucide-react";
+
+// --- Helpers ---
+const normalize = (s) =>
+  (s || "")
+    .replace(/\s+/g, " ")
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .trim();
+
+const tokenize = (s) =>
+  normalize(s)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s']/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+
+const ngrams = (tokens, n = 3) => {
+  const out = [];
+  for (let i = 0; i <= tokens.length - n; i++) {
+    out.push(tokens.slice(i, i + n).join(" "));
+  }
+  return out;
+};
+
+const sentenceSplit = (text) => {
+  const t = normalize(text);
+  if (!t) return [];
+  // Basic sentence split (good enough for class practice)
+  const parts = t
+    .replace(/\n+/g, " ")
+    .split(/(?<=[.!?])\s+(?=[A-Z0-9"'])/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  return parts.length ? parts : [t];
+};
+
+function countWords(text) {
+  return tokenize(text).length;
+}
+
+function percent(n) {
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+function buildNgramMatchData(source, draft, n = 3) {
+  const st = tokenize(source);
+  const dt = tokenize(draft);
+  const sset = new Set(ngrams(st, n));
+  const dgrams = ngrams(dt, n);
+  let hits = 0;
+  for (const g of dgrams) if (sset.has(g)) hits++;
+  const hitRate = dgrams.length ? hits / dgrams.length : 0;
+  return { hits, total: dgrams.length, hitRate };
+}
+
+function highlightLongExactPhrases(source, draft, minWords = 3) {
+  // Highlights repeated minWords-or-more exact sequences (simple, transparent)
+  const srcTokens = tokenize(source);
+  const drTokens = tokenize(draft);
+  if (!srcTokens.length || !drTokens.length) return [];
+
+  // Build a set of source ngrams for n = minWords
+  const srcN = new Set(ngrams(srcTokens, minWords));
+
+  // Find starting indices in draft where a minWords ngram matches
+  const matches = [];
+  for (let i = 0; i <= drTokens.length - minWords; i++) {
+    const g = drTokens.slice(i, i + minWords).join(" ");
+    if (srcN.has(g)) {
+      // Extend match as long as it keeps matching a source sequence
+      let j = i + minWords;
+      while (j < drTokens.length) {
+        const extended = drTokens.slice(i, j + 1).join(" ");
+        // Check if extended appears in source as a contiguous phrase
+        // (slow but fine for small classroom text)
+        const extendedStr = " " + srcTokens.join(" ") + " ";
+        if (extendedStr.includes(" " + extended + " ")) {
+          j++;
+        } else {
+          break;
+        }
+      }
+      const end = j; // exclusive
+      matches.push({ start: i, end });
+      i = end - 1; // skip ahead
+    }
+  }
+  // Merge overlaps
+  matches.sort((a, b) => a.start - b.start);
+  const merged = [];
+  for (const m of matches) {
+    const last = merged[merged.length - 1];
+    if (!last || m.start > last.end) merged.push({ ...m });
+    else last.end = Math.max(last.end, m.end);
+  }
+  return merged;
+}
+
+function renderTokenHighlights(draft, ranges) {
+  const tokens = tokenize(draft);
+  if (!tokens.length) return <span className="text-muted-foreground">(nothing yet)</span>;
+  const marks = new Array(tokens.length).fill(false);
+  for (const r of ranges) {
+    for (let i = r.start; i < r.end && i < marks.length; i++) marks[i] = true;
+  }
+
+  // Rebuild into readable-ish chunks; this is a practice visual, not perfect punctuation.
+  const out = [];
+  let i = 0;
+  while (i < tokens.length) {
+    const isMarked = marks[i];
+    let j = i;
+    while (j < tokens.length && marks[j] === isMarked) j++;
+    const chunk = tokens.slice(i, j).join(" ");
+    out.push(
+      isMarked ? (
+        <mark key={i} className="rounded px-1 py-0.5">
+          {chunk}
+        </mark>
+      ) : (
+        <span key={i}>{chunk}</span>
+      )
+    );
+    out.push(<span key={`sp-${i}`}> </span>);
+    i = j;
+  }
+  return <span className="leading-7">{out}</span>;
+}
+
+const presetSources = [
+  {
+    title: "Paste from BLS Occupational Outlook Handbook (OOH)",
+    text: "",
+  },
+];
+
+function Pill({ ok, children }) {
+  return (
+    <div
+      className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-sm ${
+        ok
+          ? "bg-background"
+          : "bg-background"
+      }`}
+    >
+      {ok ? (
+        <CheckCircle2 className="h-4 w-4" />
+      ) : (
+        <AlertTriangle className="h-4 w-4" />
+      )}
+      <span>{children}</span>
+    </div>
+  );
+}
+
+function ScoreBar({ value, label }) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-sm font-medium">{label}</span>
+        <span className="text-sm text-muted-foreground">{value}%</span>
+      </div>
+      <Progress value={value} />
+    </div>
+  );
+}
+
+export default function ParaphraseSummaryWorkshop() {
+  const [source, setSource] = useState("");
+  const [preset, setPreset] = useState(presetSources[0].title);
+
+  // BLS / OOH citation helpers
+  const [blsJobTitle, setBlsJobTitle] = useState("");
+  const [blsUrl, setBlsUrl] = useState("");
+  const [blsAccessed, setBlsAccessed] = useState(() => {
+    try {
+      return new Date().toLocaleDateString();
+    } catch {
+      return "";
+    }
+  });
+
+  const blsInText = useMemo(() => {
+    const title = (blsJobTitle || "Job Title").trim();
+    return `(BLS, ${title})`;
+  }, [blsJobTitle]);
+
+  const blsWorksCited = useMemo(() => {
+    const title = (blsJobTitle || "Job Title").trim();
+    const url = (blsUrl || "URL").trim();
+    const acc = (blsAccessed || "Date").trim();
+    return `“${title}.” Occupational Outlook Handbook, U.S. Bureau of Labor Statistics, ${url}. Accessed ${acc}.`;
+  }, [blsJobTitle, blsUrl, blsAccessed]);
+
+  function applyBlsCitation() {
+    if (!citation.trim()) setCitation(blsInText);
+    if (!citationSummary.trim()) setCitationSummary(blsInText);
+  }
+
+  const [mainIdea, setMainIdea] = useState("");
+  const [keyPoints, setKeyPoints] = useState("-");
+  const [keyTerms, setKeyTerms] = useState("");
+
+  const [paraphrase, setParaphrase] = useState("");
+  const [summary, setSummary] = useState("");
+
+  const [citation, setCitation] = useState("");
+  const [citationSummary, setCitationSummary] = useState("");
+
+  const [lockMode, setLockMode] = useState(true);
+  const [timerOn, setTimerOn] = useState(false);
+  const [secondsLeft, setSecondsLeft] = useState(90);
+
+  const [labels, setLabels] = useState({});
+
+  // Timer effect
+  React.useEffect(() => {
+    if (!timerOn) return;
+    if (secondsLeft <= 0) {
+      setTimerOn(false);
+      return;
+    }
+    const id = setInterval(() => setSecondsLeft((s) => s - 1), 1000);
+    return () => clearInterval(id);
+  }, [timerOn, secondsLeft]);
+
+  const sourceWords = useMemo(() => countWords(source), [source]);
+  const paraWords = useMemo(() => countWords(paraphrase), [paraphrase]);
+  const sumWords = useMemo(() => countWords(summary), [summary]);
+
+  const paraMatch = useMemo(
+    () => buildNgramMatchData(source, paraphrase, 3),
+    [source, paraphrase]
+  );
+  const sumMatch = useMemo(
+    () => buildNgramMatchData(source, summary, 3),
+    [source, summary]
+  );
+
+  const paraRanges = useMemo(
+    () => highlightLongExactPhrases(source, paraphrase, 3),
+    [source, paraphrase]
+  );
+  const sumRanges = useMemo(
+    () => highlightLongExactPhrases(source, summary, 3),
+    [source, summary]
+  );
+
+  const paraSimilarityScore = useMemo(() => {
+    // Higher = more similar (bad). Convert hitRate to a 0–100 scale.
+    return percent(paraMatch.hitRate * 100);
+  }, [paraMatch.hitRate]);
+
+  const sumSimilarityScore = useMemo(() => percent(sumMatch.hitRate * 100), [sumMatch.hitRate]);
+
+  const paraLengthHint = useMemo(() => {
+    if (!sourceWords || !paraWords) return null;
+    const ratio = paraWords / sourceWords;
+    // paraphrase can be similar length; too short may drop meaning
+    if (ratio < 0.6) return "Your paraphrase is much shorter than the source. Did you drop important information?";
+    if (ratio > 1.6) return "Your paraphrase is much longer than the source. Are you adding ideas that aren’t in the source?";
+    return null;
+  }, [sourceWords, paraWords]);
+
+  const summaryLengthOk = useMemo(() => {
+    if (!sourceWords || !sumWords) return false;
+    return sumWords <= Math.max(20, Math.round(sourceWords * 0.4));
+  }, [sourceWords, sumWords]);
+
+  const summaryLengthHint = useMemo(() => {
+    if (!sourceWords || !sumWords) return null;
+    if (!summaryLengthOk) {
+      return "Your summary is still pretty long. A summary should keep only the main point(s) and be much shorter than the original.";
+    }
+    if (sumWords < 8) return "Your summary might be too short to capture the main idea clearly.";
+    return null;
+  }, [sourceWords, sumWords, summaryLengthOk]);
+
+  const sentences = useMemo(() => sentenceSplit(source), [source]);
+
+  const labelCounts = useMemo(() => {
+    const counts = { main: 0, detail: 0, example: 0, background: 0, unlabeled: 0 };
+    for (let i = 0; i < sentences.length; i++) {
+      const v = labels[i];
+      if (!v) counts.unlabeled++;
+      else counts[v]++;
+    }
+    return counts;
+  }, [labels, sentences.length]);
+
+  const summaryDetailOverload = useMemo(() => {
+    // If most labeled sentences are not main, nudge.
+    const labeled = sentences.length - labelCounts.unlabeled;
+    if (labeled < 2) return false;
+    return labelCounts.main < Math.max(1, Math.round(labeled * 0.34));
+  }, [labelCounts, sentences.length]);
+
+  const coverageCheck = useMemo(() => {
+    // Compare key points list words to paraphrase presence (simple/transparent)
+    const kp = normalize(keyPoints)
+      .split("\n")
+      .map((l) => l.replace(/^[-•\*]\s*/, "").trim())
+      .filter(Boolean);
+    if (!kp.length || !paraphrase.trim()) return null;
+    const pLower = normalize(paraphrase).toLowerCase();
+    const hit = kp.filter((point) => {
+      const tokens = tokenize(point);
+      const signal = tokens.filter((t) => t.length >= 5).slice(0, 4); // pick a few meaningful tokens
+      if (!signal.length) return true;
+      return signal.some((t) => pLower.includes(t));
+    }).length;
+    const pct = Math.round((hit / kp.length) * 100);
+    return { hit, total: kp.length, pct };
+  }, [keyPoints, paraphrase]);
+
+  const stepCompletion = useMemo(() => {
+    const a = source.trim().length > 30;
+    const b = mainIdea.trim().length > 0;
+    const c = normalize(keyPoints).replace(/[-•\*]/g, "").trim().length > 0;
+    const d = keyTerms.trim().length > 0;
+    const e = paraphrase.trim().length > 0;
+    const f = citation.trim().length > 0;
+    const g = Object.keys(labels).length > 0;
+    const h = summary.trim().length > 0;
+    const i = citationSummary.trim().length > 0;
+
+    const parts = [a, b, c, d, e, f, g, h, i];
+    const done = parts.filter(Boolean).length;
+    const total = parts.length;
+    return { done, total, pct: Math.round((done / total) * 100) };
+  }, [source, mainIdea, keyPoints, keyTerms, paraphrase, citation, labels, summary, citationSummary]);
+
+  function resetAll() {
+    setMainIdea("");
+    setKeyPoints("-");
+    setKeyTerms("");
+    setParaphrase("");
+    setSummary("");
+    setCitation("");
+    setCitationSummary("");
+    setLabels({});
+    setTimerOn(false);
+    setSecondsLeft(90);
+  }
+
+  function startSetAside() {
+    setTimerOn(true);
+    setSecondsLeft(90);
+  }
+
+  async function copyText(t) {
+    try {
+      await navigator.clipboard.writeText(t);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  const paraphraseFlags = useMemo(() => {
+    const flags = [];
+    if (!paraphrase.trim()) flags.push({ type: "warn", text: "Write a paraphrase to see checks." });
+    if (paraphrase.trim() && !citation.trim()) flags.push({ type: "warn", text: "Add a citation/attribution note (even for paraphrase)." });
+    if (paraphrase.trim() && paraSimilarityScore >= 18) flags.push({ type: "warn", text: "Your wording is still pretty close to the source. Try changing sentence structure, too." });
+    if (paraRanges.length >= 2) flags.push({ type: "warn", text: "You have multiple exact phrases copied from the source. If you keep any exact wording, put it in quotation marks." });
+    if (coverageCheck && coverageCheck.pct < 60) flags.push({ type: "warn", text: "You may be dropping key points. Compare your paraphrase to your key-point list." });
+    if (paraphrase.trim() && mainIdea.trim().length === 0) flags.push({ type: "warn", text: "Write the main idea first. It makes paraphrasing easier." });
+    return flags;
+  }, [paraphrase, citation, paraSimilarityScore, paraRanges.length, coverageCheck, mainIdea]);
+
+  const summaryFlags = useMemo(() => {
+    const flags = [];
+    if (!summary.trim()) flags.push({ type: "warn", text: "Write a summary to see checks." });
+    if (summary.trim() && !citationSummary.trim()) flags.push({ type: "warn", text: "Add a citation/attribution note (even for summary)." });
+    if (summary.trim() && !summaryLengthOk) flags.push({ type: "warn", text: "Your summary may be too long. Keep only main point(s)." });
+    if (summary.trim() && sumSimilarityScore >= 18) flags.push({ type: "warn", text: "Your summary wording is close to the source. Use your own phrasing." });
+    if (summaryDetailOverload) flags.push({ type: "warn", text: "Your labeling suggests you may be keeping too many details. A summary should keep only main points." });
+    return flags;
+  }, [summary, citationSummary, summaryLengthOk, sumSimilarityScore, summaryDetailOverload]);
+
+  const sourceHidden = lockMode && timerOn;
+
+  return (
+    <div className="min-h-screen w-full bg-background p-4 md:p-8">
+      <div className="mx-auto max-w-6xl space-y-6">
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.35 }}
+          className="flex flex-col gap-3"
+        >
+          <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+            <div>
+              <h1 className="text-2xl md:text-3xl font-semibold">Paraphrase + Summary Workshop</h1>
+              <p className="text-muted-foreground">
+                Practice the process: understand → set it aside → write → compare → revise. Use this as a self-check.
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              <div className="hidden md:block w-56">
+                <ScoreBar value={stepCompletion.pct} label="Progress" />
+              </div>
+              <Button variant="outline" onClick={resetAll} className="gap-2">
+                <RefreshCcw className="h-4 w-4" /> Reset
+              </Button>
+            </div>
+          </div>
+        </motion.div>
+
+        <Tabs defaultValue="1" className="w-full">
+          <TabsList className="grid w-full grid-cols-3">
+            <TabsTrigger value="1">1) Understand</TabsTrigger>
+            <TabsTrigger value="2">2) Paraphrase</TabsTrigger>
+            <TabsTrigger value="3">3) Summarize</TabsTrigger>
+          </TabsList>
+
+          {/* --- Understand --- */}
+          <TabsContent value="1">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <Card className="rounded-2xl shadow-sm">
+                <CardHeader>
+                  <CardTitle className="flex items-center justify-between gap-3">
+                    <span>Source text (from BLS OOH)</span>
+                    <div className="flex items-center gap-2">
+                      <Select
+                        value={preset}
+                        onValueChange={(v) => {
+                          setPreset(v);
+                          // Keep as a placeholder preset; students paste their own excerpt from BLS.
+                        }}
+                      >
+                        <SelectTrigger className="w-[340px]">
+                          <SelectValue placeholder="Source" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {presetSources.map((p) => (
+                            <SelectItem key={p.title} value={p.title}>
+                              {p.title}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </CardTitle>
+                  <p className="text-sm text-muted-foreground">
+                    Copy and paste 1 paragraph (or 2–5 sentences) from a BLS Occupational Outlook Handbook page.
+                    This page will help you paraphrase/summarize it and self-check.
+                  </p>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  <Textarea
+                    value={source}
+                    onChange={(e) => setSource(e.target.value)}
+                    className="min-h-[220px]"
+                    placeholder="Paste text from a BLS OOH page here (2–5 sentences or 1 paragraph)…"
+                  />
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div className="space-y-2">
+                      <Label>BLS job title (for citation)</Label>
+                      <Input
+                        value={blsJobTitle}
+                        onChange={(e) => setBlsJobTitle(e.target.value)}
+                        placeholder="Example: Registered Nurses"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>BLS OOH URL (for Works Cited)</Label>
+                      <Input
+                        value={blsUrl}
+                        onChange={(e) => setBlsUrl(e.target.value)}
+                        placeholder="Paste the OOH page URL"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Date accessed</Label>
+                      <Input
+                        value={blsAccessed}
+                        onChange={(e) => setBlsAccessed(e.target.value)}
+                        placeholder="Example: February 12, 2026"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Auto MLA (in-text)</Label>
+                      <div className="rounded-xl border px-3 py-2 text-sm">{blsInText}</div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-medium">Works Cited (MLA)</div>
+                        <div className="text-xs text-muted-foreground">Copy/paste and replace anything missing.</div>
+                      </div>
+                      <Button size="sm" variant="outline" className="gap-2" onClick={() => copyText(blsWorksCited)}>
+                        <Copy className="h-4 w-4" /> Copy Works Cited
+                      </Button>
+                    </div>
+                    <div className="mt-2 rounded-xl bg-muted p-3 text-sm leading-6">{blsWorksCited}</div>
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                      <Button size="sm" className="gap-2" onClick={applyBlsCitation}>
+                        <CheckCircle2 className="h-4 w-4" /> Use this in-text citation below
+                      </Button>
+                      <Badge variant="secondary">Tip: choose 2 sentences from the BLS page if a full paragraph feels too hard.</Badge>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="secondary">Words: {sourceWords}</Badge>
+                    <Badge variant="secondary">Sentences: {sentences.length || 0}</Badge>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="gap-2"
+                      onClick={() => copyText(source)}
+                    >
+                      <Copy className="h-4 w-4" /> Copy source
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card className="rounded-2xl shadow-sm">
+                <CardHeader>
+                  <CardTitle>Quick understanding notes</CardTitle>
+                  <p className="text-sm text-muted-foreground">
+                    Do these first. They make paraphrasing and summarizing much easier.
+                  </p>
+                </CardHeader>
+                <CardContent className="space-y-5">
+                  <div className="space-y-2">
+                    <Label>Main idea (1 sentence, plain language)</Label>
+                    <Textarea
+                      value={mainIdea}
+                      onChange={(e) => setMainIdea(e.target.value)}
+                      className="min-h-[84px]"
+                      placeholder="In your own words: what is the main point?"
+                    />
+                    <div className="flex items-center justify-between text-xs text-muted-foreground">
+                      <span>Tip: aim for 15–30 words.</span>
+                      <span>{countWords(mainIdea)} words</span>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label>Key points (3 bullets)</Label>
+                    <Textarea
+                      value={keyPoints}
+                      onChange={(e) => setKeyPoints(e.target.value)}
+                      className="min-h-[120px]"
+                      placeholder="- Key point 1\n- Key point 2\n- Key point 3"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label>Key terms (3–5 important words/phrases)</Label>
+                    <Input
+                      value={keyTerms}
+                      onChange={(e) => setKeyTerms(e.target.value)}
+                      placeholder="Example: paraphrase, meaning, structure, citation"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      It’s okay if key terms stay similar to the source. Your job is to change the surrounding wording and structure.
+                    </p>
+                  </div>
+
+                  <Separator />
+
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="text-sm font-medium">Ready to paraphrase?</div>
+                      <div className="text-xs text-muted-foreground">
+                        Next tab will let you hide the source to practice “set it aside.”
+                      </div>
+                    </div>
+                    <Badge variant={mainIdea.trim() ? "default" : "secondary"}>
+                      Main idea {mainIdea.trim() ? "✓" : ""}
+                    </Badge>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          </TabsContent>
+
+          {/* --- Paraphrase --- */}
+          <TabsContent value="2">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <Card className="rounded-2xl shadow-sm">
+                <CardHeader>
+                  <CardTitle className="flex items-center justify-between">
+                    <span>Paraphrase setup</span>
+                    <div className="flex items-center gap-2">
+                      <Label className="text-sm text-muted-foreground">Set-it-aside mode</Label>
+                      <Switch checked={lockMode} onCheckedChange={setLockMode} />
+                    </div>
+                  </CardTitle>
+                  <p className="text-sm text-muted-foreground">
+                    If set-it-aside mode is on, you can start a short timer that hides the source while you draft.
+                  </p>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      className="gap-2"
+                      onClick={startSetAside}
+                      disabled={!lockMode || timerOn || !source.trim()}
+                    >
+                      <Timer className="h-4 w-4" /> Start 90s set-it-aside
+                    </Button>
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        setTimerOn(false);
+                        setSecondsLeft(90);
+                      }}
+                      disabled={!timerOn}
+                    >
+                      Stop
+                    </Button>
+                    <Badge variant="secondary">Source words: {sourceWords}</Badge>
+                    <Badge variant="secondary">Your words: {paraWords}</Badge>
+                  </div>
+
+                  <AnimatePresence>
+                    {timerOn && (
+                      <motion.div
+                        initial={{ opacity: 0, y: -6 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -6 }}
+                        className="rounded-xl border p-3"
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <Timer className="h-4 w-4" />
+                            <div className="text-sm font-medium">Set it aside timer</div>
+                          </div>
+                          <div className="text-sm tabular-nums">{secondsLeft}s</div>
+                        </div>
+                        <p className="mt-2 text-xs text-muted-foreground">
+                          Draft from memory. Don’t worry about perfection. You will compare and revise after.
+                        </p>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+
+                  <div className="space-y-2">
+                    <Label>Source (for compare step)</Label>
+                    <div className={`rounded-xl border p-3 text-sm leading-6 ${sourceHidden ? "opacity-40 blur-[2px] select-none" : ""}`}>
+                      {sourceHidden ? "(Source hidden during set-it-aside mode)" : source}
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label>Attribution / citation note</Label>
+                    <Input
+                      value={citation}
+                      onChange={(e) => setCitation(e.target.value)}
+                      placeholder="Example: (Smith) or (Smith 42) or Source: Title/URL"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Even when you paraphrase, the idea came from the source, so you still cite it.
+                    </p>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card className="rounded-2xl shadow-sm">
+                <CardHeader>
+                  <CardTitle>Write your paraphrase</CardTitle>
+                  <p className="text-sm text-muted-foreground">
+                    Keep the same meaning. Change wording AND structure. If you keep any exact wording, put it in quotation marks.
+                  </p>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <Textarea
+                    value={paraphrase}
+                    onChange={(e) => setParaphrase(e.target.value)}
+                    className="min-h-[180px]"
+                    placeholder="Write your paraphrase here..."
+                  />
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="space-y-3">
+                      <ScoreBar value={paraSimilarityScore} label="Similarity (lower is better)" />
+                      {paraLengthHint && (
+                        <div className="text-sm text-muted-foreground">{paraLengthHint}</div>
+                      )}
+                      {coverageCheck && (
+                        <div className="text-sm text-muted-foreground">
+                          Key-point coverage: {coverageCheck.hit}/{coverageCheck.total} ({coverageCheck.pct}%)
+                        </div>
+                      )}
+                    </div>
+                    <div className="space-y-2">
+                      <div className="text-sm font-medium">Exact phrase highlights</div>
+                      <div className="rounded-xl border p-3 text-sm">
+                        {renderTokenHighlights(paraphrase, paraRanges)}
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Highlight = 3+ words in a row that also appear in the source.
+                      </p>
+                    </div>
+                  </div>
+
+                  <Separator />
+
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div className="text-sm font-medium">Checks</div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="gap-2"
+                        onClick={() => copyText(paraphrase + (citation.trim() ? ` ${citation.trim()}` : ""))}
+                        disabled={!paraphrase.trim()}
+                      >
+                        <Copy className="h-4 w-4" /> Copy paraphrase + cite
+                      </Button>
+                    </div>
+                    <div className="flex flex-col gap-2">
+                      <Pill ok={Boolean(paraphrase.trim())}>You wrote a paraphrase.</Pill>
+                      <Pill ok={Boolean(citation.trim())}>You included an attribution/citation note.</Pill>
+                      <Pill ok={paraSimilarityScore < 18}>Your wording/structure is not too close to the source.</Pill>
+                      <Pill ok={paraRanges.length <= 1}>You avoided long exact copied phrases.</Pill>
+                    </div>
+
+                    {paraphraseFlags.length > 0 && (
+                      <div className="rounded-xl border p-3">
+                        <div className="text-sm font-medium">Revision nudges</div>
+                        <ul className="mt-2 list-disc pl-5 text-sm text-muted-foreground space-y-1">
+                          {paraphraseFlags.map((f, idx) => (
+                            <li key={idx}>{f.text}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          </TabsContent>
+
+          {/* --- Summarize --- */}
+          <TabsContent value="3">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <Card className="rounded-2xl shadow-sm">
+                <CardHeader>
+                  <CardTitle>Sort the source (main points vs details)</CardTitle>
+                  <p className="text-sm text-muted-foreground">
+                    Label each sentence. A summary keeps only the main point(s) and is much shorter.
+                  </p>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="flex flex-wrap gap-2">
+                    <Badge variant="secondary">Main: {labelCounts.main}</Badge>
+                    <Badge variant="secondary">Detail: {labelCounts.detail}</Badge>
+                    <Badge variant="secondary">Example: {labelCounts.example}</Badge>
+                    <Badge variant="secondary">Background: {labelCounts.background}</Badge>
+                    <Badge variant="secondary">Unlabeled: {labelCounts.unlabeled}</Badge>
+                  </div>
+
+                  <div className="space-y-3">
+                    {sentences.map((s, idx) => (
+                      <div key={idx} className="rounded-xl border p-3">
+                        <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+                          <div className="text-sm leading-6 md:pr-4">{s}</div>
+                          <div className="w-full md:w-52">
+                            <Select
+                              value={labels[idx] || ""}
+                              onValueChange={(v) => setLabels((prev) => ({ ...prev, [idx]: v }))}
+                            >
+                              <SelectTrigger>
+                                <SelectValue placeholder="Label" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="main">Main point</SelectItem>
+                                <SelectItem value="detail">Supporting detail</SelectItem>
+                                <SelectItem value="example">Example</SelectItem>
+                                <SelectItem value="background">Background/extra</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {summaryDetailOverload && (
+                    <div className="rounded-xl border p-3 text-sm text-muted-foreground">
+                      Heads up: you labeled few sentences as “main point.” If this passage has multiple sentences, your summary should usually focus on the main point(s).
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card className="rounded-2xl shadow-sm">
+                <CardHeader>
+                  <CardTitle>Write your summary</CardTitle>
+                  <p className="text-sm text-muted-foreground">
+                    Keep only the main idea(s). No examples unless they are necessary to understand the main point.
+                  </p>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="space-y-2">
+                    <Label>Attribution / citation note</Label>
+                    <Input
+                      value={citationSummary}
+                      onChange={(e) => setCitationSummary(e.target.value)}
+                      placeholder="Example: (Smith) or (Smith 42) or Source: Title/URL"
+                    />
+                  </div>
+
+                  <Textarea
+                    value={summary}
+                    onChange={(e) => setSummary(e.target.value)}
+                    className="min-h-[180px]"
+                    placeholder="Write your summary here..."
+                  />
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="space-y-3">
+                      <ScoreBar value={sumSimilarityScore} label="Similarity (lower is better)" />
+                      <div className="flex flex-wrap gap-2">
+                        <Badge variant="secondary">Source: {sourceWords} words</Badge>
+                        <Badge variant="secondary">Summary: {sumWords} words</Badge>
+                      </div>
+                      {summaryLengthHint && (
+                        <div className="text-sm text-muted-foreground">{summaryLengthHint}</div>
+                      )}
+                    </div>
+
+                    <div className="space-y-2">
+                      <div className="text-sm font-medium">Exact phrase highlights</div>
+                      <div className="rounded-xl border p-3 text-sm">
+                        {renderTokenHighlights(summary, sumRanges)}
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Highlight = 3+ words in a row that also appear in the source.
+                      </p>
+                    </div>
+                  </div>
+
+                  <Separator />
+
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div className="text-sm font-medium">Checks</div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="gap-2"
+                        onClick={() => copyText(summary + (citationSummary.trim() ? ` ${citationSummary.trim()}` : ""))}
+                        disabled={!summary.trim()}
+                      >
+                        <Copy className="h-4 w-4" /> Copy summary + cite
+                      </Button>
+                    </div>
+
+                    <div className="flex flex-col gap-2">
+                      <Pill ok={Boolean(summary.trim())}>You wrote a summary.</Pill>
+                      <Pill ok={Boolean(citationSummary.trim())}>You included an attribution/citation note.</Pill>
+                      <Pill ok={summaryLengthOk}>Your summary is much shorter than the source.</Pill>
+                      <Pill ok={sumSimilarityScore < 18}>Your wording is not too close to the source.</Pill>
+                    </div>
+
+                    {summaryFlags.length > 0 && (
+                      <div className="rounded-xl border p-3">
+                        <div className="text-sm font-medium">Revision nudges</div>
+                        <ul className="mt-2 list-disc pl-5 text-sm text-muted-foreground space-y-1">
+                          {summaryFlags.map((f, idx) => (
+                            <li key={idx}>{f.text}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    <Separator />
+
+                    <div className="rounded-2xl border p-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-medium">Final copy box (paste into Canvas)</div>
+                          <div className="text-xs text-muted-foreground">Includes your citation notes.</div>
+                        </div>
+                        <Button
+                          size="sm"
+                          className="gap-2"
+                          onClick={() =>
+                            copyText(
+                              `Paraphrase: ${normalize(paraphrase)} ${normalize(citation)}\n\nSummary: ${normalize(summary)} ${normalize(citationSummary)}`
+                            )
+                          }
+                          disabled={!paraphrase.trim() && !summary.trim()}
+                        >
+                          <Copy className="h-4 w-4" /> Copy all
+                        </Button>
+                      </div>
+                      <div className="mt-3 rounded-xl bg-muted p-3 text-sm whitespace-pre-wrap">
+                        {`Paraphrase: ${normalize(paraphrase)} ${normalize(citation)}\n\nSummary: ${normalize(summary)} ${normalize(citationSummary)}`}
+                      </div>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          </TabsContent>
+        </Tabs>
+
+        <Card className="rounded-2xl shadow-sm">
+          <CardHeader>
+            <CardTitle className="text-base">Teacher notes</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm text-muted-foreground space-y-2">
+            <p>
+              This tool is a practice checker. It does not “grade” writing; it gives visible, rule-based nudges students can act on.
+            </p>
+            <ul className="list-disc pl-5 space-y-1">
+              <li>Similarity score uses repeated 3-word sequences (lower is better).</li>
+              <li>Highlighted phrases show exact copied runs of 3+ words.</li>
+              <li>Summary length rule: ≤ 40% of source (minimum cap for very short sources).</li>
+            </ul>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
